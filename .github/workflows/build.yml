@@ -1,0 +1,49 @@
+name: Build iOS App
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          cd ${{ github.workspace }}
+          xcodegen generate
+
+      - name: Build & Archive
+        run: |
+          xcodebuild archive \
+            -project Xiaoshufang.xcodeproj \
+            -scheme Xiaoshufang \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Xiaoshufang.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/Xiaoshufang.xcarchive/Products/Applications/Xiaoshufang.app Payload/
+          zip -r Xiaoshufang.ipa Payload
+          ls -la Xiaoshufang.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Xiaoshufang-ipa
+          path: Xiaoshufang.ipa
+          retention-days: 30
