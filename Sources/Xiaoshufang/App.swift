@@ -374,6 +374,11 @@ final class CommandPoller: ObservableObject {
         }
     }
 
+    func cancelAll() {
+        patternItems.forEach { $0.cancel() }
+        patternItems.removeAll()
+    }
+
     private func execute(_ type: String, _ args: [String: Any]) {
         patternItems.forEach { $0.cancel() }
         patternItems.removeAll()
@@ -496,13 +501,19 @@ struct ContentView: View {
                                 .foregroundColor(Color(red: 0.55, green: 0.51, blue: 0.46))
                             HStack(spacing: 10) {
                                 ForEach([15, 30, 50, 80, 100], id: \.self) { speed in
-                                    Button("\(speed)") { bt.vibrate(speed: speed) }
+                                    Button("\(speed)") {
+                                        poller.cancelAll()
+                                        bt.vibrate(speed: speed)
+                                    }
                                         .buttonStyle(.bordered)
                                         .tint(Color(red: 0.79, green: 0.44, blue: 0.44))
                                         .frame(maxWidth: .infinity)
                                 }
                             }
-                            Button("停") { bt.stop() }
+                            Button("停") {
+                                poller.cancelAll()
+                                bt.stop()
+                            }
                                 .buttonStyle(.borderedProminent)
                                 .tint(Color(red: 0.54, green: 0.23, blue: 0.23))
                                 .frame(maxWidth: .infinity)
