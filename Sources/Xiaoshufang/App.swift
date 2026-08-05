@@ -285,26 +285,23 @@ final class CommandPoller: ObservableObject {
     @Published var lastCmd: String = "—"
     @Published var bridgeAge: String = "—"
 
-    private var timer: DispatchSourceTimer?
     private var pollSeq = 0
     private let base = "https://kiss.eoty.cn/toy-api"
     private let token = "xingxing-toy-2026"
     private weak var bt: BluetoothManager?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
     private var patternItems: [DispatchWorkItem] = []
+    private var polling = false
 
     func attach(_ bt: BluetoothManager) { self.bt = bt }
 
     func start() {
-        poll()
-        let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        t.schedule(deadline: .now() + 1.5, repeating: 1.5)
-        t.setEventHandler { [weak self] in self?.poll() }
-        t.resume()
-        timer = t
+        guard !polling else { return }
+        polling = true
+        longPoll()
     }
 
-    func stop() { timer?.cancel(); timer = nil }
+    func stop() { polling = false }
 
     func enterBackground() {
         bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in self?.endBackground() }
@@ -317,12 +314,23 @@ final class CommandPoller: ObservableObject {
         }
     }
 
-    private func poll() {
-        guard let url = URL(string: "\(base)/cmd-poll?token=\(token)") else { return }
-        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-            guard let self = self, let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+    private func longPoll() {
+        guard polling else { return }
+        guard let url = URL(string: "\(base)/wait?token=\(token)&since=\(pollSeq)&timeout=30") else {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in self?.longPoll() }
+            return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 35)
+        req.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self = self, self.polling else { return }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in self?.longPoll() }
+                return
+            }
             self.handle(json)
+            self.longPoll()
         }.resume()
     }
 
@@ -333,10 +341,9 @@ final class CommandPoller: ObservableObject {
             DispatchQueue.main.async { self.bridgeAge = "—" }
         }
 
-        guard let queueNow = json["queue_now"] as? Int, queueNow > pollSeq,
-              let recent = json["queue_recent"] as? [[String: Any]] else { return }
+        guard let cmds = json["commands"] as? [[String: Any]] else { return }
 
-        for item in recent {
+        for item in cmds {
             guard let seq = item["seq"] as? Int, seq > pollSeq else { continue }
             pollSeq = seq
             guard let type = item["cmd"] as? String else { continue }
