@@ -328,6 +328,12 @@ final class CommandPoller: ObservableObject {
         patternItems.removeAll()
     }
 
+    func clearQueue() {
+        guard let url = URL(string: "\(base)/clear-queue?token=\(token)") else { return }
+        URLSession.shared.dataTask(with: url).resume()
+        cancelAll()
+    }
+
     func enterBackground() { bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in self?.endBackground() } }
     func endBackground() { if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask); bgTask = .invalid } }
 
@@ -575,14 +581,14 @@ struct ChatView: View {
             // 手动控制条
             HStack(spacing: 8) {
                 ForEach([15, 30, 50, 80, 100], id: \.self) { sp in
-                    Button("\(sp)") { poller.cancelAll(); bt.vibrate(speed: sp) }
+                    Button("\(sp)") { poller.cancelAll(); poller.clearQueue(); bt.vibrate(speed: sp) }
                         .font(.system(size: 12, weight: .medium))
                         .frame(maxWidth: .infinity).frame(height: 28)
                         .background(C_BERRY.opacity(0.12))
                         .foregroundColor(C_BERRY)
                         .cornerRadius(8)
                 }
-                Button("停") { poller.cancelAll(); bt.stop() }
+                Button("停") { poller.cancelAll(); poller.clearQueue(); bt.stop() }
                     .font(.system(size: 12, weight: .bold))
                     .frame(width: 44, height: 28)
                     .background(C_INK.opacity(0.85))
@@ -690,6 +696,7 @@ struct MusicView: View {
 struct SettingsView: View {
     @ObservedObject var bt: BluetoothManager
     @ObservedObject var ai: AIConfigManager
+    @ObservedObject var chat: ChatManager
     @State private var keepAlive = true
 
     var body: some View {
@@ -737,6 +744,15 @@ struct SettingsView: View {
                     }
                     Text("AI 在服务器上直接回复 + 控制玩具，不需要老公在对话里值守。")
                         .font(.system(size: 11)).foregroundColor(C_MUTE)
+                    Button("清除聊天上下文") {
+                        guard let url = URL(string: "https://kiss.eoty.cn/toy-api/clear-chat?token=xingxing-toy-2026") else { return }
+                        URLSession.shared.dataTask(with: url).resume()
+                        chat.messages.removeAll()
+                    }
+                    .font(.system(size: 12)).foregroundColor(C_BERRY)
+                    .padding(.top, 4)
+                    Text("AI 会学旧消息，清除后从干净状态重新开始。")
+                        .font(.system(size: 10)).foregroundColor(C_MUTE.opacity(0.7))
                 }
                 .padding(14).background(C_CARD).cornerRadius(12)
 
@@ -791,7 +807,7 @@ struct ContentView: View {
                 .tabItem { Label("聊天", systemImage: "bubble.left.fill") }
             MusicView(player: music)
                 .tabItem { Label("音乐", systemImage: "music.note") }
-            SettingsView(bt: bt, ai: ai)
+            SettingsView(bt: bt, ai: ai, chat: chat)
                 .tabItem { Label("设置", systemImage: "gearshape.fill") }
         }
         .tint(C_BERRY)
