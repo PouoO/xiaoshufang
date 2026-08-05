@@ -448,6 +448,7 @@ final class ChatManager: ObservableObject {
                 guard let seq = m["seq"] as? Int, seq > (self?.since ?? 0) else { continue }
                 self?.since = seq
                 let from = m["from"] as? String ?? ""
+                if from == "she" { continue }
                 let msg = m["msg"] as? String ?? ""
                 let ts = Date(timeIntervalSince1970: m["ts"] as? Double ?? 0)
                 DispatchQueue.main.async { self?.messages.append((from, msg, ts)) }
