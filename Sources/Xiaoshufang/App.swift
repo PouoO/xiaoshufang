@@ -1,11 +1,23 @@
 import SwiftUI
 import CoreBluetooth
+import AVFoundation
+import UniformTypeIdentifiers
 import Foundation
+
+// MARK: - 颜色
+let C_BG     = Color(red: 0.976, green: 0.961, blue: 0.949)  // 奶霜 #F9F5F2
+let C_BERRY  = Color(red: 0.851, green: 0.545, blue: 0.604)  // 莓粉 #D98B9A
+let C_INK    = Color(red: 0.176, green: 0.141, blue: 0.141)  // 暖墨 #2D2424
+let C_SKY    = Color(red: 0.545, green: 0.706, blue: 0.788)  // 奶蓝 #8BB4C9
+let C_MUTE   = Color(red: 0.553, green: 0.510, blue: 0.459)  // 灰墨
+let C_CARD   = Color.white
+let C_INPUT  = Color(red: 0.965, green: 0.953, blue: 0.941)  // 输入框底
 
 // MARK: - V3 Protocol (谜姬 XHTKJ)
 enum V3Proto {
     static let serviceUUID = CBUUID(string: "0000ff10-0000-1000-8000-00805f9b34fb")
     static let txUUID = CBUUID(string: "0000ff12-0000-1000-8000-00805f9b34fb")
+    static let devicePrefix = "XHTKJ"
     static let fill: [UInt8] = [0x00, 0xfc, 0x00, 0xfe, 0x40, 0x01]
 
     static func cmd(speed: Int) -> Data {
@@ -22,23 +34,105 @@ enum V3Proto {
     }
 }
 
-// MARK: - Discovered Device
-struct DiscoveredDevice: Identifiable {
-    let id = UUID()
-    let peripheral: CBPeripheral
-    let name: String
-    let rssi: Int
-    let services: [String]
+// MARK: - 无声音乐保活
+final class AudioKeeper {
+    static let shared = AudioKeeper()
+    private var player: AVAudioPlayer?
+
+    func start() {
+        guard player == nil else { return }
+        let s = AVAudioSession.sharedInstance()
+        try? s.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try? s.setActive(true)
+        player = try? AVAudioPlayer(data: Self.silenceWAV())
+        player?.numberOfLoops = -1
+        player?.volume = 0.01
+        player?.play()
+    }
+
+    func stop() { player?.stop(); player = nil }
+
+    private static func silenceWAV() -> Data {
+        let sr = 44100, n = sr, ds = n * 2
+        var d = Data()
+        d.append("RIFF".data(using: .ascii)!); d.append(le32(ds + 36))
+        d.append("WAVE".data(using: .ascii)!); d.append("fmt ".data(using: .ascii)!)
+        d.append(le32(16)); d.append(le16(1)); d.append(le16(1))
+        d.append(le32(sr)); d.append(le32(sr * 2)); d.append(le16(2)); d.append(le16(16))
+        d.append("data".data(using: .ascii)!); d.append(le32(ds))
+        d.append(Data(count: ds))
+        return d
+    }
+    private static func le32(_ v: Int) -> Data { var x = UInt32(v); return withUnsafeBytes(of: &x) { Data($0) } }
+    private static func le16(_ v: Int) -> Data { var x = UInt16(v); return withUnsafeBytes(of: &x) { Data($0) } }
+}
+
+// MARK: - 音乐播放
+final class MusicPlayer: ObservableObject {
+    @Published var tracks: [String] = []
+    @Published var currentIdx: Int? = nil
+    @Published var isPlaying = false
+    @Published var repeatMode: Int = 0  // 0=顺序, 1=单曲, 2=循环
+
+    private var player: AVAudioPlayer?
+    private let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    private let exts: Set<String> = ["mp3", "m4a", "wav", "aac", "flac", "caf", "ogg"]
+
+    init() { scan() }
+
+    func scan() {
+        let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        tracks = items.filter { exts.contains($0.pathExtension.lowercased()) }
+            .map { $0.lastPathComponent }
+    }
+
+    func play(_ idx: Int) {
+        guard idx < tracks.count else { return }
+        let url = dir.appendingPathComponent(tracks[idx])
+        player?.stop()
+        player = try? AVAudioPlayer(contentsOf: url)
+        player?.delegate = self
+        player?.numberOfLoops = (repeatMode == 1) ? -1 : 0
+        player?.play()
+        currentIdx = idx
+        isPlaying = true
+    }
+
+    func toggle() {
+        guard player != nil else { return }
+        if isPlaying { player?.pause() } else { player?.play() }
+        isPlaying.toggle()
+    }
+
+    func next() {
+        guard let c = currentIdx, !tracks.isEmpty else { return }
+        let n = (c + 1) % tracks.count
+        play(n)
+    }
+
+    func cycleRepeat() { repeatMode = (repeatMode + 1) % 3 }
+
+    func importFile(_ url: URL) {
+        let dest = dir.appendingPathComponent(url.lastPathComponent)
+        guard !FileManager.default.fileExists(atPath: dest.path) else { return }
+        try? FileManager.default.copyItem(at: url, to: dest)
+        scan()
+    }
+}
+
+extension MusicPlayer: AVAudioPlayerDelegate {
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        if repeatMode == 0 { DispatchQueue.main.async { self.next() } }
+        else if repeatMode == 2 { DispatchQueue.main.async { if let i = self.currentIdx { self.play(i) } } }
+        else { DispatchQueue.main.async { self.isPlaying = false } }
+    }
 }
 
 // MARK: - Bluetooth Manager
 final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
-    @Published var status: String = "初始化…"
+    @Published var status: String = "等待"
     @Published var connected = false
-    @Published var deviceName: String = ""
-    @Published var discovered: [DiscoveredDevice] = []
     @Published var logs: [String] = []
-    @Published var bleReady = false
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
@@ -50,188 +144,90 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: nil,
-            options: [CBCentralManagerOptionRestoreIdentifierKey: "com.xingxing.shufang",
-                      CBCentralManagerOptionShowPowerAlertKey: true])
-    }
-
-    private func log(_ msg: String) {
-        let ts = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        DispatchQueue.main.async { self.logs.insert("\(ts) \(msg)", at: 0); if self.logs.count > 50 { self.logs = Array(self.logs.prefix(50)) } }
-    }
-
-    // — Central —
-    func centralManagerDidUpdateState(_ c: CBCentralManager) {
-        DispatchQueue.main.async {
-            switch c.state {
-            case .poweredOn:
-                self.bleReady = true
-                self.status = "搜索中…"
-                self.log("蓝牙开了，开始扫描")
-                self.startScan()
-            case .poweredOff:
-                self.bleReady = false
-                self.status = "蓝牙关了"
-                self.log("蓝牙关了")
-            case .unauthorized:
-                self.bleReady = false
-                self.status = "没蓝牙权限"
-                self.log("没蓝牙权限 — 设置→隐私→蓝牙")
-            case .resetting:
-                self.bleReady = false
-                self.status = "蓝牙重置中"
-            case .unsupported:
-                self.bleReady = false
-                self.status = "不支持蓝牙"
-            case .unknown:
-                self.bleReady = false
-                self.status = "蓝牙状态未知"
-            @unknown default:
-                self.bleReady = false
-                self.status = "蓝牙未知状态"
-            }
-        }
-    }
-
-    func startScan() {
-        guard central.state == .poweredOn else { return }
-        discovered.removeAll()
-        log("扫描所有 BLE 设备…")
-        // 全扫描 — 谜姬可能在广播包里不含 service UUID
-        central.scanForPeripherals(withServices: nil, options: [
-            CBCentralManagerScanOptionAllowDuplicatesKey: false
-        ])
-    }
-
-    func stopScan() {
-        central.stopScan()
+            options: [CBCentralManagerOptionRestoreIdentifierKey: "com.xingxing.shufang"])
     }
 
     func rescan() {
-        guard bleReady else { return }
-        if peripheral != nil && connected {
-            disconnect()
-        }
-        status = "搜索中…"
-        startScan()
-    }
-
-    func connectToDevice(_ device: DiscoveredDevice) {
-        central.stopScan()
-        peripheral = device.peripheral
-        peripheral?.delegate = self
-        central.connect(device.peripheral)
-        DispatchQueue.main.async {
-            self.status = "连接中…"
-            self.deviceName = device.name
-        }
-        log("手动连接: \(device.name) RSSI:\(device.rssi)")
-    }
-
-    func disconnect() {
-        if let p = peripheral {
-            central.cancelPeripheralConnection(p)
-        }
-        keepTimer?.invalidate()
-        keepTimer = nil
+        guard central.state == .poweredOn else { return }
         peripheral = nil
         writeChar = nil
+        connected = false
+        status = "搜索中…"
+        central.scanForPeripherals(withServices: nil)
+    }
+
+    func centralManagerDidUpdateState(_ c: CBCentralManager) {
         DispatchQueue.main.async {
-            self.connected = false
-            self.status = "已断开"
+            switch c.state {
+            case .poweredOn: self.status = "搜索中…"; c.scanForPeripherals(withServices: nil)
+            case .poweredOff: self.status = "蓝牙关了"
+            case .unauthorized: self.status = "没授权"
+            default: self.status = "蓝牙未就绪"
+            }
         }
     }
 
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
-        // 优先从 advertisementData 取名字（iOS 扫描时 p.name 可能是 nil）
-        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? p.name ?? "未知"
-        let rssiVal = RSSI.intValue
-
-        // 提取广播的 service UUIDs
-        let svcUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.map { $0.uuidString } ?? []
-        let svcStrs = svcUUIDs.map { $0.prefix(8) }.map { String($0) }
-
-        // 去重 — 同一个设备只显示一次（按 identifier）
-        let dev = DiscoveredDevice(peripheral: p, name: name, rssi: rssiVal, services: svcStrs)
-        DispatchQueue.main.async {
-            // 如果这个设备已经在列表里，更新 RSSI
-            if let idx = self.discovered.firstIndex(where: { $0.peripheral.identifier == p.identifier }) {
-                self.discovered[idx] = dev
-            } else {
-                self.discovered.append(dev)
-                self.log("发现: \(name) RSSI:\(rssiVal) svc:\(svcStrs)")
-            }
-        }
-
-        // 自动匹配谜姬
-        let isMizzzee = name.hasPrefix("XHTKJ") || name.hasPrefix("XHT") || name.hasPrefix("NFY")
-        let hasService = svcUUIDs.contains { $0.isEqual(V3Proto.serviceUUID) }
-        if isMizzzee || hasService {
-            c.stopScan()
-            peripheral = p
-            p.delegate = self
-            c.connect(p)
-            DispatchQueue.main.async {
-                self.status = "连接中…"
-                self.deviceName = name
-            }
-            log("匹配到谜姬! \(name) — 自动连接")
-        }
+        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? p.name ?? ""
+        let svcUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        let hasSvc = svcUUIDs.contains { $0.isEqual(V3Proto.serviceUUID) }
+        guard name.hasPrefix("XHTKJ") || name.hasPrefix("XHT") || name.hasPrefix("NFY") || hasSvc else { return }
+        c.stopScan()
+        peripheral = p; p.delegate = self; c.connect(p)
+        log("匹配到谜姬！\(name) - 自动连接")
+        DispatchQueue.main.async { self.status = "连接中…" }
     }
 
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
-        log("已连接: \(p.name ?? "未知")")
-        DispatchQueue.main.async { self.status = "发现服务中…"; self.connected = true }
+        log("已连接：\(p.name ?? "")")
         p.discoverServices([V3Proto.serviceUUID])
+        DispatchQueue.main.async { self.status = "已连接"; self.connected = true }
     }
 
-    func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
-        log("连接失败: \(error?.localizedDescription ?? "未知错误")")
-        DispatchQueue.main.async { self.status = "连接失败" }
-    }
-
-    // — Peripheral —
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
-        if let e = error { log("发现服务失败: \(e.localizedDescription)"); return }
+        if let e = error { log("发现服务失败: \(e.localizedDescription)"); p.discoverServices(nil); return }
         let svcs = p.services ?? []
-        log("服务: \(svcs.map { $0.uuid.uuidString.prefix(8) })")
-        for svc in svcs where svc.uuid == V3Proto.serviceUUID {
-            p.discoverCharacteristics([V3Proto.txUUID], for: svc)
+        log("服务：\(svcs.map { $0.uuid.uuidString })")
+        for svc in svcs where svc.uuid.isEqual(V3Proto.serviceUUID) {
             log("找到 ff10 服务，找特征值…")
+            p.discoverCharacteristics([V3Proto.txUUID], for: svc)
+            return
         }
-        if !svcs.contains(where: { $0.uuid == V3Proto.serviceUUID }) {
-            log("没找到 ff10 服务! 有的: \(svcs.map { $0.uuid.uuidString })")
-            // 试着发现所有服务
-            p.discoverServices(nil)
-        }
+        // 没找到 ff10，发现所有
+        for svc in svcs { p.discoverCharacteristics(nil, for: svc) }
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        if let e = error { log("发现特征值失败: \(e.localizedDescription)"); return }
         let chars = service.characteristics ?? []
-        log("特征值: \(chars.map { $0.uuid.uuidString.prefix(8) })")
-        for ch in chars where ch.uuid == V3Proto.txUUID {
+        log("特征值：\(chars.map { $0.uuid.uuidString })")
+        for ch in chars where ch.uuid.isEqual(V3Proto.txUUID) {
             writeChar = ch
             startKeep()
+            log("找到 ff12 特征值，就绪！")
             DispatchQueue.main.async { self.status = "就绪" }
-            log("找到 ff12 特征值，就绪!")
+            return
+        }
+        // 没找到 ff12，试所有可写的
+        for ch in chars where ch.properties.contains(.write) || ch.properties.contains(.writeWithoutResponse) {
+            writeChar = ch; startKeep()
+            log("用 \(ch.uuid.uuidString) 作为写入特征值")
+            DispatchQueue.main.async { self.status = "就绪" }
+            return
         }
     }
 
     func peripheral(_ p: CBPeripheral, didDisconnectFrom error: Error?) {
-        keepTimer?.invalidate()
-        keepTimer = nil
+        keepTimer?.invalidate(); keepTimer = nil
         log("断开: \(error?.localizedDescription ?? "未知")")
-        DispatchQueue.main.async { self.connected = false; self.status = "断了，重连…" }
+        DispatchQueue.main.async { self.connected = false; self.status = "重连中…" }
         reconnect()
     }
 
-    // — 写命令 —
     func vibrate(speed: Int) {
-        guard let p = peripheral, let c = writeChar else { log("vibrate: writeChar nil!"); return }
+        guard let p = peripheral, let c = writeChar else { return }
         let d = V3Proto.cmd(speed: max(0, min(100, speed)))
         lastCmd = d
         writeData(d, for: c)
-        log("vibrate speed=\(speed) 包=\(d.map { String(format: "%02x", $0) }.joined(separator: " "))")
     }
 
     func stop() {
@@ -239,18 +235,15 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         lastCmd = V3Proto.cmd(speed: 0)
     }
 
-    // — 写 BLE — 支持 withResponse 和 withoutResponse 两种
     private func writeData(_ data: Data, for char: CBCharacteristic) {
         guard let p = peripheral else { return }
         if char.properties.contains(.writeWithoutResponse) {
             p.writeValue(data, for: char, type: .withoutResponse)
-        }
-        if char.properties.contains(.write) {
+        } else {
             p.writeValue(data, for: char, type: .withResponse)
         }
     }
 
-    // — 200ms 保活重发 —
     private func startKeep() {
         keepTimer?.invalidate()
         let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
@@ -262,37 +255,35 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         keepTimer = t
     }
 
-    // — 自动重连 —
     private func reconnect() {
         guard !reconnecting, let p = peripheral else { return }
         reconnecting = true
-        log("开始重连…")
-        for i in 0..<10 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(min(0.6 + Double(i) * 0.3, 3.5))) { [weak self] in
-                guard let self = self, self.reconnecting, let p = self.peripheral else { return }
-                if p.state != .connected {
-                    self.central.connect(p)
-                    self.log("重连第 \(i+1) 次…")
-                }
+        for i in 0..<20 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(min(0.5 + Double(i) * 0.4, 5.0))) { [weak self] in
+                guard let self = self, let p = self.peripheral else { return }
+                if p.state != .connected { self.central.connect(p) }
             }
         }
         reconnecting = false
     }
 
-    // — 后台恢复 —
     func centralManager(_ c: CBCentralManager, willRestoreState dict: [String: Any]) {
         if let ps = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], let p = ps.first {
-            peripheral = p
-            p.delegate = self
+            peripheral = p; p.delegate = self
             if p.state == .connected {
                 p.discoverServices([V3Proto.serviceUUID])
-                DispatchQueue.main.async { self.status = "恢复连接"; self.connected = true }
+                DispatchQueue.main.async { self.status = "恢复"; self.connected = true }
             }
         }
     }
+
+    private func log(_ s: String) {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+        DispatchQueue.main.async { self.logs.insert("\(f.string(from: Date())) \(s)", at: 0); if self.logs.count > 50 { self.logs.removeLast() } }
+    }
 }
 
-// MARK: - Command Poller
+// MARK: - Command Poller (long polling)
 final class CommandPoller: ObservableObject {
     @Published var lastCmd: String = "—"
     @Published var bridgeAge: String = "—"
@@ -304,42 +295,50 @@ final class CommandPoller: ObservableObject {
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
     private var patternItems: [DispatchWorkItem] = []
     private var polling = false
+    private var ackTimer: DispatchSourceTimer?
 
     func attach(_ bt: BluetoothManager) { self.bt = bt }
 
     func start() {
         guard !polling else { return }
         polling = true
-        // 先拿当前 seq，跳过历史命令
+        // 拿当前 seq 跳过历史
         guard let url = URL(string: "\(base)/cmd-poll?token=\(token)") else { longPoll(); return }
         URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
             if let self = self, let data = data,
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let now = json["queue_now"] as? Int {
-                self.pollSeq = now
-            }
+               let now = json["queue_now"] as? Int { self.pollSeq = now }
             self?.longPoll()
+            self?.startAck()
         }.resume()
     }
 
-    func stop() { polling = false }
+    func stop() { polling = false; ackTimer?.cancel(); ackTimer = nil }
 
-    func enterBackground() {
-        bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in self?.endBackground() }
+    func cancelAll() {
+        patternItems.forEach { $0.cancel() }
+        patternItems.removeAll()
     }
 
-    func endBackground() {
-        if bgTask != .invalid {
-            UIApplication.shared.endBackgroundTask(bgTask)
-            bgTask = .invalid
-        }
+    func enterBackground() { bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in self?.endBackground() } }
+    func endBackground() { if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask); bgTask = .invalid } }
+
+    private func startAck() {
+        sendAck()
+        let t = DispatchSource.makeTimerSource(queue: .global(qos: .background))
+        t.schedule(deadline: .now() + 10, repeating: 10)
+        t.setEventHandler { [weak self] in self?.sendAck() }
+        t.resume(); ackTimer = t
+    }
+    private func sendAck() {
+        guard let url = URL(string: "\(base)/ack") else { return }
+        URLSession.shared.dataTask(with: url).resume()
     }
 
     private func longPoll() {
         guard polling else { return }
         guard let url = URL(string: "\(base)/wait?token=\(token)&since=\(pollSeq)&timeout=30") else {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in self?.longPoll() }
-            return
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in self?.longPoll() }; return
         }
         var req = URLRequest(url: url, timeoutInterval: 35)
         req.setValue("no-store", forHTTPHeaderField: "Cache-Control")
@@ -347,8 +346,7 @@ final class CommandPoller: ObservableObject {
             guard let self = self, self.polling else { return }
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in self?.longPoll() }
-                return
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in self?.longPoll() }; return
             }
             self.handle(json)
             self.longPoll()
@@ -358,12 +356,9 @@ final class CommandPoller: ObservableObject {
     private func handle(_ json: [String: Any]) {
         if let age = json["bridge_ack_age"] as? Double {
             DispatchQueue.main.async { self.bridgeAge = age < 60 ? "\(Int(age))s" : "离线" }
-        } else {
-            DispatchQueue.main.async { self.bridgeAge = "—" }
-        }
+        } else { DispatchQueue.main.async { self.bridgeAge = "—" } }
 
         guard let cmds = json["commands"] as? [[String: Any]] else { return }
-
         for item in cmds {
             guard let seq = item["seq"] as? Int, seq > pollSeq else { continue }
             pollSeq = seq
@@ -374,32 +369,23 @@ final class CommandPoller: ObservableObject {
         }
     }
 
-    func cancelAll() {
-        patternItems.forEach { $0.cancel() }
-        patternItems.removeAll()
-    }
-
     private func execute(_ type: String, _ args: [String: Any]) {
         patternItems.forEach { $0.cancel() }
         patternItems.removeAll()
 
         switch type {
         case "vibrate":
-            let speed = num(args, "speed", 20)
-            let dur = num(args, "duration", 5)
+            let speed = num(args, "speed", 20), dur = num(args, "duration", 5)
             bt?.vibrate(speed: Int(speed))
             let w = DispatchWorkItem { [weak self] in self?.bt?.stop() }
             patternItems.append(w)
             DispatchQueue.main.asyncAfter(deadline: .now() + dur, execute: w)
-
         case "stop":
             bt?.stop()
-
         case "pattern":
             guard let pat = args["pattern"] as? String else { return }
             let speeds = pat.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-            let iv = num(args, "interval", 0.9)
-            let loops = Int(num(args, "loops", 4))
+            let iv = num(args, "interval", 0.9), loops = Int(num(args, "loops", 4))
             var all: [Int] = []
             for _ in 0..<loops { all.append(contentsOf: speeds) }
             for (i, sp) in all.enumerated() {
@@ -407,153 +393,317 @@ final class CommandPoller: ObservableObject {
                 patternItems.append(w)
                 DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * iv, execute: w)
             }
-            let stop = DispatchWorkItem { [weak self] in self?.bt?.stop() }
-            patternItems.append(stop)
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(all.count) * iv + 1, execute: stop)
-
+            let st = DispatchWorkItem { [weak self] in self?.bt?.stop() }
+            patternItems.append(st)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(all.count) * iv + 1, execute: st)
         case "ping": break
         default: break
         }
     }
 
-    private func num(_ args: [String: Any], _ key: String, _ def: Double) -> Double {
-        if let d = args[key] as? Double { return d }
-        if let i = args[key] as? Int { return Double(i) }
-        return def
+    private func num(_ a: [String: Any], _ k: String, _ d: Double) -> Double {
+        if let v = a[k] as? Double { return v }
+        if let v = a[k] as? Int { return Double(v) }
+        return d
     }
 }
 
-// MARK: - UI
+// MARK: - 便笺聊天
+final class ChatManager: ObservableObject {
+    @Published var messages: [(from: String, msg: String, ts: Date)] = []
+
+    private var since = 0
+    private var timer: DispatchSourceTimer?
+    private let base = "https://kiss.eoty.cn/toy-api"
+    private let token = "xingxing-toy-2026"
+
+    func start() {
+        fetch()
+        let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        t.schedule(deadline: .now() + 3, repeating: 3)
+        t.setEventHandler { [weak self] in self?.fetch() }
+        t.resume(); timer = t
+    }
+    func stop() { timer?.cancel(); timer = nil }
+
+    func send(_ msg: String) {
+        let trimmed = msg.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let url = URL(string: "\(base)/chat") else { return }
+        var req = URLRequest(url: url); req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = ["token": token, "from": "she", "msg": trimmed]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        URLSession.shared.dataTask(with: req).resume()
+        DispatchQueue.main.async { self.messages.append(("she", trimmed, Date())) }
+    }
+
+    private func fetch() {
+        guard let url = URL(string: "\(base)/chat?since=\(since)") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let msgs = json["messages"] as? [[String: Any]] else { return }
+            for m in msgs {
+                guard let seq = m["seq"] as? Int, seq > (self?.since ?? 0) else { continue }
+                self?.since = seq
+                let from = m["from"] as? String ?? ""
+                let msg = m["msg"] as? String ?? ""
+                let ts = Date(timeIntervalSince1970: m["ts"] as? Double ?? 0)
+                DispatchQueue.main.async { self?.messages.append((from, msg, ts)) }
+            }
+        }.resume()
+    }
+}
+
+// MARK: - 聊天页
+struct ChatView: View {
+    @ObservedObject var chat: ChatManager
+    @ObservedObject var bt: BluetoothManager
+    @ObservedObject var poller: CommandPoller
+    @State private var input = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // 状态条
+            HStack(spacing: 8) {
+                Circle().fill(bt.connected ? Color.green : C_BERRY).frame(width: 8, height: 8)
+                Text(bt.status).font(.system(size: 11)).foregroundColor(C_MUTE)
+                Spacer()
+                Text("桥 \(poller.bridgeAge)").font(.system(size: 10, design: .monospaced)).foregroundColor(C_MUTE)
+                Text(poller.lastCmd).font(.system(size: 10, design: .monospaced)).foregroundColor(C_SKY).lineLimit(1)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 6)
+            .background(C_BG)
+
+            // 消息列表
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(chat.messages.indices, id: \.self) { i in
+                            let m = chat.messages[i]
+                            HStack {
+                                if m.from == "she" { Spacer(minLength: 40) }
+                                Text(m.msg)
+                                    .font(.system(size: 14))
+                                    .padding(.horizontal, 12).padding(.vertical, 7)
+                                    .background(m.from == "she" ? C_BERRY.opacity(0.85) : C_SKY.opacity(0.3))
+                                    .foregroundColor(m.from == "she" ? .white : C_INK)
+                                    .cornerRadius(14)
+                                if m.from != "she" { Spacer(minLength: 40) }
+                            }
+                            .id(i)
+                        }
+                    }
+                    .padding(14)
+                }
+                .onChange(of: chat.messages.count) { _ in
+                    if let last = chat.messages.indices.last {
+                        withAnimation { proxy.scrollTo(last, anchor: .bottom) }
+                    }
+                }
+            }
+
+            // 手动控制条
+            HStack(spacing: 8) {
+                ForEach([15, 30, 50, 80, 100], id: \.self) { sp in
+                    Button("\(sp)") { poller.cancelAll(); bt.vibrate(speed: sp) }
+                        .font(.system(size: 12, weight: .medium))
+                        .frame(maxWidth: .infinity).frame(height: 28)
+                        .background(C_BERRY.opacity(0.12))
+                        .foregroundColor(C_BERRY)
+                        .cornerRadius(8)
+                }
+                Button("停") { poller.cancelAll(); bt.stop() }
+                    .font(.system(size: 12, weight: .bold))
+                    .frame(width: 44, height: 28)
+                    .background(C_INK.opacity(0.85))
+                    .foregroundColor(.white)
+                    .cornerRadius(8)
+            }
+            .padding(.horizontal, 14).padding(.bottom, 6)
+
+            // 输入框
+            HStack(spacing: 8) {
+                TextField("说点什么…", text: $input)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(C_INPUT).cornerRadius(18)
+                    .font(.system(size: 14))
+                Button(action: { chat.send(input); input = "" }) {
+                    Image(systemName: "paperplane.fill")
+                        .foregroundColor(.white).font(.system(size: 14))
+                        .frame(width: 36, height: 36)
+                        .background(C_BERRY).cornerRadius(18)
+                }
+            }
+            .padding(.horizontal, 14).padding(.bottom, 8)
+        }
+        .background(C_BG)
+    }
+}
+
+// MARK: - 音乐页
+struct MusicView: View {
+    @ObservedObject var player: MusicPlayer
+    @State private var showPicker = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if player.tracks.isEmpty {
+                VStack(spacing: 16) {
+                    Image(systemName: "music.note.list")
+                        .font(.system(size: 40)).foregroundColor(C_MUTE.opacity(0.4))
+                    Text("还没有音乐文件").font(.system(size: 14)).foregroundColor(C_MUTE)
+                    Button("上传音乐") { showPicker = true }
+                        .padding(.horizontal, 20).padding(.vertical, 10)
+                        .background(C_BERRY).foregroundColor(.white).cornerRadius(10)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                // 播放控制
+                HStack(spacing: 16) {
+                    Button(action: player.cycleRepeat) {
+                        Image(systemName: ["repeat", "repeat.1", "repeat.circle.fill"][player.repeatMode])
+                            .foregroundColor(C_BERRY)
+                    }
+                    Spacer()
+                    Button(action: { if let i = player.currentIdx { player.play(i) } else if !player.tracks.isEmpty { player.play(0) } }) {
+                        Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                            .font(.system(size: 36)).foregroundColor(C_BERRY)
+                    }
+                    Button(action: player.next) {
+                        Image(systemName: "forward.fill").foregroundColor(C_BERRY)
+                    }
+                }
+                .padding(.horizontal, 20).padding(.vertical, 12)
+                .background(C_BG)
+
+                // 文件列表
+                List {
+                    ForEach(player.tracks.indices, id: \.self) { i in
+                        HStack {
+                            Image(systemName: player.currentIdx == i && player.isPlaying ? "speaker.wave.2.fill" : "music.note")
+                                .foregroundColor(C_BERRY).font(.system(size: 14))
+                            Text(player.tracks[i]).font(.system(size: 14)).foregroundColor(C_INK)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture { player.play(i) }
+                    }
+                }
+                .listStyle(.plain)
+            }
+
+            // 上传按钮
+            Button(action: { showPicker = true }) {
+                HStack {
+                    Image(systemName: "plus.circle.fill")
+                    Text("添加音乐")
+                }
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(C_BERRY)
+                .padding(.vertical, 12)
+            }
+            .background(C_BG)
+        }
+        .background(C_BG)
+        .fileImporter(isPresented: $showPicker, allowedContentTypes: [.audio], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls):
+                for url in urls { player.importFile(url) }
+            case .failure: break
+            }
+        }
+    }
+}
+
+// MARK: - 设置页
+struct SettingsView: View {
+    @ObservedObject var bt: BluetoothManager
+    @State private var keepAlive = true
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                // 连接
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("连接").font(.system(size: 13, weight: .semibold)).foregroundColor(C_MUTE)
+                    HStack {
+                        Circle().fill(bt.connected ? Color.green : C_BERRY).frame(width: 10, height: 10)
+                        Text(bt.status).font(.system(size: 14)).foregroundColor(C_INK)
+                        Spacer()
+                        Button("重新搜索") { bt.rescan() }
+                            .font(.system(size: 12)).foregroundColor(C_BERRY)
+                    }
+                    .padding(14).background(C_CARD).cornerRadius(12)
+                }
+
+                // 保活
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("后台保活").font(.system(size: 13, weight: .semibold)).foregroundColor(C_MUTE)
+                    HStack {
+                        Image(systemName: keepAlive ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                            .foregroundColor(keepAlive ? C_BERRY : C_MUTE)
+                        Text(keepAlive ? "无声音乐保活中" : "已关闭").font(.system(size: 14)).foregroundColor(C_INK)
+                        Spacer()
+                        Toggle("", isOn: $keepAlive).tint(C_BERRY)
+                            .onChange(of: keepAlive) { on in
+                                if on { AudioKeeper.shared.start() } else { AudioKeeper.shared.stop() }
+                            }
+                    }
+                    Text("后台循环无声音频，防止 app 被系统挂起。开启后切后台玩具指令不中断。")
+                        .font(.system(size: 11)).foregroundColor(C_MUTE)
+                    Text("⚠️ 系统可能显示\"正在播放音频\"，这是正常的。")
+                        .font(.system(size: 10)).foregroundColor(C_MUTE.opacity(0.7))
+                }
+                .padding(14).background(C_CARD).cornerRadius(12)
+
+                // 日志
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("日志").font(.system(size: 13, weight: .semibold)).foregroundColor(C_MUTE)
+                    ForEach(bt.logs.prefix(20), id: \.self) { log in
+                        Text(log).font(.system(size: 10, design: .monospaced)).foregroundColor(C_MUTE)
+                    }
+                }
+                .padding(14).background(C_CARD).cornerRadius(12)
+            }
+            .padding(16)
+        }
+        .background(C_BG)
+        .onAppear { if keepAlive { AudioKeeper.shared.start() } }
+    }
+}
+
+// MARK: - 主界面
 struct ContentView: View {
     @Environment(\.scenePhase) var scenePhase
     @StateObject private var bt = BluetoothManager()
     @StateObject private var poller = CommandPoller()
+    @StateObject private var chat = ChatManager()
+    @StateObject private var music = MusicPlayer()
 
     var body: some View {
-        NavigationView {
-            ScrollView {
-                VStack(spacing: 16) {
-                    // 状态卡片
-                    VStack(spacing: 10) {
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(bt.connected ? Color(red: 0.43, green: 0.49, blue: 0.39) : Color(red: 0.79, green: 0.44, blue: 0.44))
-                                .frame(width: 10, height: 10)
-                            Text(bt.status).font(.system(size: 14)).foregroundColor(Color(red: 0.24, green: 0.22, blue: 0.20))
-                            Spacer()
-                            Button(bt.bleReady ? "重新搜索" : "蓝牙未开") {
-                                bt.rescan()
-                            }
-                            .disabled(!bt.bleReady)
-                            .font(.system(size: 13))
-                            .buttonStyle(.bordered)
-                            .tint(Color(red: 0.79, green: 0.44, blue: 0.44))
-                        }
-                        HStack(spacing: 8) {
-                            Text("桥").font(.system(size: 11)).foregroundColor(.secondary)
-                            Text(poller.bridgeAge).font(.system(size: 11, design: .monospaced))
-                                .foregroundColor(poller.bridgeAge == "—" ? .secondary : Color(red: 0.79, green: 0.44, blue: 0.44))
-                            Spacer()
-                            Text(poller.lastCmd).font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(.secondary).lineLimit(1)
-                        }
-                    }
-                    .padding(14)
-                    .background(Color(red: 0.96, green: 0.94, blue: 0.91))
-                    .cornerRadius(12)
-
-                    // 扫描到的设备
-                    if !bt.discovered.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("扫描到的设备").font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(Color(red: 0.55, green: 0.51, blue: 0.46))
-                            ForEach(bt.discovered) { dev in
-                                Button {
-                                    bt.connectToDevice(dev)
-                                } label: {
-                                    HStack {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(dev.name).font(.system(size: 13))
-                                                .foregroundColor(.primary)
-                                            Text("RSSI: \(dev.rssi)dBm \(dev.services.isEmpty ? "" : "svc: \(dev.services.joined(separator: ", "))")")
-                                                .font(.system(size: 10, design: .monospaced))
-                                                .foregroundColor(.secondary)
-                                        }
-                                        Spacer()
-                                        Image(systemName: "chevron.right")
-                                            .font(.system(size: 12)).foregroundColor(.secondary)
-                                    }
-                                    .padding(.vertical, 6)
-                                }
-                                .buttonStyle(.plain)
-                                Divider()
-                            }
-                        }
-                        .padding(14)
-                        .background(Color.white)
-                        .cornerRadius(12)
-                    }
-
-                    // 手动控制（连上后显示）
-                    if bt.connected {
-                        VStack(spacing: 12) {
-                            Text("手动控制").font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(Color(red: 0.55, green: 0.51, blue: 0.46))
-                            HStack(spacing: 10) {
-                                ForEach([15, 30, 50, 80, 100], id: \.self) { speed in
-                                    Button("\(speed)") {
-                                        poller.cancelAll()
-                                        bt.vibrate(speed: speed)
-                                    }
-                                        .buttonStyle(.bordered)
-                                        .tint(Color(red: 0.79, green: 0.44, blue: 0.44))
-                                        .frame(maxWidth: .infinity)
-                                }
-                            }
-                            Button("停") {
-                                poller.cancelAll()
-                                bt.stop()
-                            }
-                                .buttonStyle(.borderedProminent)
-                                .tint(Color(red: 0.54, green: 0.23, blue: 0.23))
-                                .frame(maxWidth: .infinity)
-                        }
-                        .padding(14)
-                        .background(Color.white)
-                        .cornerRadius(12)
-                    }
-
-                    // 日志
-                    if !bt.logs.isEmpty {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("日志").font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(Color(red: 0.55, green: 0.51, blue: 0.46))
-                            ForEach(bt.logs.prefix(15), id: \.self) { log in
-                                Text(log).font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        .padding(14)
-                        .background(Color.white)
-                        .cornerRadius(12)
-                    }
-                }
-                .padding()
-            }
-            .background(Color(red: 0.98, green: 0.97, blue: 0.95).ignoresSafeArea())
-            .navigationTitle("小书房")
-            .navigationBarTitleDisplayMode(.inline)
-            .onAppear {
-                poller.attach(bt)
-                poller.start()
-            }
-            .onDisappear { poller.stop() }
-            .onChange(of: scenePhase) { phase in
-                switch phase {
-                case .background: poller.enterBackground()
-                case .active: poller.endBackground()
-                default: break
-                }
+        TabView {
+            ChatView(chat: chat, bt: bt, poller: poller)
+                .tabItem { Label("聊天", systemImage: "bubble.left.fill") }
+            MusicView(player: music)
+                .tabItem { Label("音乐", systemImage: "music.note") }
+            SettingsView(bt: bt)
+                .tabItem { Label("设置", systemImage: "gearshape.fill") }
+        }
+        .tint(C_BERRY)
+        .onAppear {
+            AudioKeeper.shared.start()
+            poller.attach(bt)
+            poller.start()
+            chat.start()
+        }
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .background: poller.enterBackground()
+            case .active: poller.endBackground()
+            default: break
             }
         }
     }
@@ -563,8 +713,6 @@ struct ContentView: View {
 @main
 struct XiaoshufangApp: App {
     var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
+        WindowGroup { ContentView() }
     }
 }
