@@ -68,7 +68,7 @@ final class AudioKeeper {
 }
 
 // MARK: - 音乐播放
-final class MusicPlayer: ObservableObject {
+final class MusicPlayer: NSObject, ObservableObject {
     @Published var tracks: [String] = []
     @Published var currentIdx: Int? = nil
     @Published var isPlaying = false
@@ -78,7 +78,7 @@ final class MusicPlayer: ObservableObject {
     private let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     private let exts: Set<String> = ["mp3", "m4a", "wav", "aac", "flac", "caf", "ogg"]
 
-    init() { scan() }
+    override init() { scan() }
 
     func scan() {
         let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
