@@ -114,8 +114,16 @@ final class MusicPlayer: NSObject, ObservableObject {
 
     func importFile(_ url: URL) {
         let dest = dir.appendingPathComponent(url.lastPathComponent)
-        guard !FileManager.default.fileExists(atPath: dest.path) else { return }
-        try? FileManager.default.copyItem(at: url, to: dest)
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer { if didStart { url.stopAccessingSecurityScopedResource() } }
+        if FileManager.default.fileExists(atPath: dest.path) {
+            try? FileManager.default.removeItem(at: dest)
+        }
+        do {
+            try FileManager.default.copyItem(at: url, to: dest)
+        } catch {
+            print("导入失败: \(error)")
+        }
         scan()
     }
 }
@@ -382,6 +390,19 @@ final class CommandPoller: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + dur, execute: w)
         case "stop":
             bt?.stop()
+        case "ramp":
+            let start = num(args, "start", 20), target = num(args, "target", 80), dur = num(args, "duration", 5)
+            let steps = max(2, Int(dur / 0.5))
+            for i in 0...steps {
+                let progress = Double(i) / Double(steps)
+                let speed = Int(start + (target - start) * progress)
+                let w = DispatchWorkItem { [weak self] in self?.bt?.vibrate(speed: speed) }
+                patternItems.append(w)
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * (dur / Double(steps)), execute: w)
+            }
+            let st = DispatchWorkItem { [weak self] in self?.bt?.stop() }
+            patternItems.append(st)
+            DispatchQueue.main.asyncAfter(deadline: .now() + dur + 2, execute: st)
         case "pattern":
             guard let pat = args["pattern"] as? String else { return }
             let speeds = pat.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
@@ -418,11 +439,19 @@ final class ChatManager: ObservableObject {
     private let token = "xingxing-toy-2026"
 
     func start() {
-        fetch()
-        let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        t.schedule(deadline: .now() + 3, repeating: 3)
-        t.setEventHandler { [weak self] in self?.fetch() }
-        t.resume(); timer = t
+        guard let url = URL(string: "\(base)/chat?since=0") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            if let data = data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let now = json["now"] as? Int {
+                self?.since = now
+            }
+            self?.fetch()
+            let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+            t.schedule(deadline: .now() + 3, repeating: 3)
+            t.setEventHandler { [weak self] in self?.fetch() }
+            t.resume(); self?.timer = t
+        }.resume()
     }
     func stop() { timer?.cancel(); timer = nil }
 
@@ -448,12 +477,50 @@ final class ChatManager: ObservableObject {
                 guard let seq = m["seq"] as? Int, seq > (self?.since ?? 0) else { continue }
                 self?.since = seq
                 let from = m["from"] as? String ?? ""
-                if from == "she" { continue }
+                if from == "she" || from == "her" { continue }
                 let msg = m["msg"] as? String ?? ""
                 let ts = Date(timeIntervalSince1970: m["ts"] as? Double ?? 0)
                 DispatchQueue.main.async { self?.messages.append((from, msg, ts)) }
             }
         }.resume()
+    }
+}
+
+// MARK: - AI 配置
+final class AIConfigManager: ObservableObject {
+    @Published var enabled = false
+    @Published var model = "deepseek-v4-flash-free"
+    @Published var models: [String] = []
+    @Published var loaded = false
+
+    private let base = "https://kiss.eoty.cn/toy-api"
+    private let token = "xingxing-toy-2026"
+
+    func load() {
+        guard let url = URL(string: "\(base)/ai-config") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            DispatchQueue.main.async {
+                self?.enabled = json["enabled"] as? Bool ?? false
+                self?.model = json["model"] as? String ?? "deepseek-v4-flash-free"
+                self?.models = json["models"] as? [String] ?? []
+                self?.loaded = true
+            }
+        }.resume()
+    }
+
+    func update(enabled: Bool? = nil, model: String? = nil) {
+        if let e = enabled { DispatchQueue.main.async { self.enabled = e } }
+        if let m = model { DispatchQueue.main.async { self.model = m } }
+        var body: [String: Any] = ["token": token]
+        if let e = enabled { body["enabled"] = e }
+        if let m = model { body["model"] = m }
+        guard let url = URL(string: "\(base)/ai-config") else { return }
+        var req = URLRequest(url: url); req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        URLSession.shared.dataTask(with: req).resume()
     }
 }
 
@@ -468,7 +535,7 @@ struct ChatView: View {
         VStack(spacing: 0) {
             // 状态条
             HStack(spacing: 8) {
-                Circle().fill(bt.connected ? Color.green : C_BERRY).frame(width: 8, height: 8)
+                Circle().fill(bt.connected ? C_SKY : C_BERRY).frame(width: 8, height: 8)
                 Text(bt.status).font(.system(size: 11)).foregroundColor(C_MUTE)
                 Spacer()
                 Text("桥 \(poller.bridgeAge)").font(.system(size: 10, design: .monospaced)).foregroundColor(C_MUTE)
@@ -484,14 +551,14 @@ struct ChatView: View {
                         ForEach(chat.messages.indices, id: \.self) { i in
                             let m = chat.messages[i]
                             HStack {
-                                if m.from == "she" { Spacer(minLength: 40) }
+                                if m.from == "she" || m.from == "her" { Spacer(minLength: 40) }
                                 Text(m.msg)
                                     .font(.system(size: 14))
                                     .padding(.horizontal, 12).padding(.vertical, 7)
-                                    .background(m.from == "she" ? C_BERRY.opacity(0.85) : C_SKY.opacity(0.3))
-                                    .foregroundColor(m.from == "she" ? .white : C_INK)
+                                    .background(m.from == "she" || m.from == "her" ? C_BERRY.opacity(0.85) : C_SKY.opacity(0.3))
+                                    .foregroundColor(m.from == "she" || m.from == "her" ? .white : C_INK)
                                     .cornerRadius(14)
-                                if m.from != "she" { Spacer(minLength: 40) }
+                                if m.from != "she" && m.from != "her" { Spacer(minLength: 40) }
                             }
                             .id(i)
                         }
@@ -622,6 +689,7 @@ struct MusicView: View {
 // MARK: - 设置页
 struct SettingsView: View {
     @ObservedObject var bt: BluetoothManager
+    @ObservedObject var ai: AIConfigManager
     @State private var keepAlive = true
 
     var body: some View {
@@ -631,7 +699,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("连接").font(.system(size: 13, weight: .semibold)).foregroundColor(C_MUTE)
                     HStack {
-                        Circle().fill(bt.connected ? Color.green : C_BERRY).frame(width: 10, height: 10)
+                        Circle().fill(bt.connected ? C_SKY : C_BERRY).frame(width: 10, height: 10)
                         Text(bt.status).font(.system(size: 14)).foregroundColor(C_INK)
                         Spacer()
                         Button("重新搜索") { bt.rescan() }
@@ -639,6 +707,38 @@ struct SettingsView: View {
                     }
                     .padding(14).background(C_CARD).cornerRadius(12)
                 }
+
+                // AI 陪玩
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("AI 陪玩").font(.system(size: 13, weight: .semibold)).foregroundColor(C_MUTE)
+                    HStack {
+                        Image(systemName: ai.enabled ? "brain.head.profile.fill" : "brain.head.profile")
+                            .foregroundColor(ai.enabled ? C_BERRY : C_MUTE)
+                        Text(ai.enabled ? "AI 已开启" : "AI 已关闭").font(.system(size: 14)).foregroundColor(C_INK)
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { ai.enabled },
+                            set: { ai.update(enabled: $0) }
+                        )).tint(C_BERRY)
+                    }
+                    if ai.enabled && !ai.models.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(ai.models, id: \.self) { m in
+                                    Button(m) { ai.update(model: m) }
+                                        .font(.system(size: 11))
+                                        .padding(.horizontal, 10).padding(.vertical, 6)
+                                        .background(ai.model == m ? C_BERRY.opacity(0.85) : C_BG)
+                                        .foregroundColor(ai.model == m ? .white : C_MUTE)
+                                        .cornerRadius(8)
+                                }
+                            }
+                        }
+                    }
+                    Text("AI 在服务器上直接回复 + 控制玩具，不需要老公在对话里值守。")
+                        .font(.system(size: 11)).foregroundColor(C_MUTE)
+                }
+                .padding(14).background(C_CARD).cornerRadius(12)
 
                 // 保活
                 VStack(alignment: .leading, spacing: 8) {
@@ -655,7 +755,7 @@ struct SettingsView: View {
                     }
                     Text("后台循环无声音频，防止 app 被系统挂起。开启后切后台玩具指令不中断。")
                         .font(.system(size: 11)).foregroundColor(C_MUTE)
-                    Text("⚠️ 系统可能显示\"正在播放音频\"，这是正常的。")
+                    Text("系统可能显示"正在播放音频"，这是正常的。")
                         .font(.system(size: 10)).foregroundColor(C_MUTE.opacity(0.7))
                 }
                 .padding(14).background(C_CARD).cornerRadius(12)
@@ -683,6 +783,7 @@ struct ContentView: View {
     @StateObject private var poller = CommandPoller()
     @StateObject private var chat = ChatManager()
     @StateObject private var music = MusicPlayer()
+    @StateObject private var ai = AIConfigManager()
 
     var body: some View {
         TabView {
@@ -690,7 +791,7 @@ struct ContentView: View {
                 .tabItem { Label("聊天", systemImage: "bubble.left.fill") }
             MusicView(player: music)
                 .tabItem { Label("音乐", systemImage: "music.note") }
-            SettingsView(bt: bt)
+            SettingsView(bt: bt, ai: ai)
                 .tabItem { Label("设置", systemImage: "gearshape.fill") }
         }
         .tint(C_BERRY)
@@ -699,6 +800,7 @@ struct ContentView: View {
             poller.attach(bt)
             poller.start()
             chat.start()
+            ai.load()
         }
         .onChange(of: scenePhase) { phase in
             switch phase {
