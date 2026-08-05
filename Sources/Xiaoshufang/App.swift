@@ -78,7 +78,7 @@ final class MusicPlayer: NSObject, ObservableObject {
     private let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     private let exts: Set<String> = ["mp3", "m4a", "wav", "aac", "flac", "caf", "ogg"]
 
-    override init() { scan() }
+    override init() { super.init(); scan() }
 
     func scan() {
         let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
