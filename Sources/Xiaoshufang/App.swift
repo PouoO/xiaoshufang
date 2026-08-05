@@ -164,7 +164,7 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
 
         // 自动匹配谜姬
         let isMizzzee = name.hasPrefix("XHTKJ") || name.hasPrefix("XHT") || name.hasPrefix("NFY")
-        let hasService = svcUUIDs.contains(V3Proto.serviceUUID)
+        let hasService = svcUUIDs.contains { $0.isEqual(V3Proto.serviceUUID) }
         if isMizzzee || hasService {
             c.stopScan()
             peripheral = p
