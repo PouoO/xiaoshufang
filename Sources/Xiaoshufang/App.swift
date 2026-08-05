@@ -755,7 +755,7 @@ struct SettingsView: View {
                     }
                     Text("后台循环无声音频，防止 app 被系统挂起。开启后切后台玩具指令不中断。")
                         .font(.system(size: 11)).foregroundColor(C_MUTE)
-                    Text("系统可能显示"正在播放音频"，这是正常的。")
+                    Text("系统可能显示正在播放音频提示，这是正常的。")
                         .font(.system(size: 10)).foregroundColor(C_MUTE.opacity(0.7))
                 }
                 .padding(14).background(C_CARD).cornerRadius(12)
