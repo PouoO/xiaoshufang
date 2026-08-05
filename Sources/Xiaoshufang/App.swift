@@ -227,15 +227,27 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
 
     // — 写命令 —
     func vibrate(speed: Int) {
-        guard let p = peripheral, let c = writeChar else { return }
+        guard let p = peripheral, let c = writeChar else { log("vibrate: writeChar nil!"); return }
         let d = V3Proto.cmd(speed: max(0, min(100, speed)))
         lastCmd = d
-        p.writeValue(d, for: c, type: .withoutResponse)
+        writeData(d, for: c)
+        log("vibrate speed=\(speed) 包=\(d.map { String(format: "%02x", $0) }.joined(separator: " "))")
     }
 
     func stop() {
         vibrate(speed: 0)
         lastCmd = V3Proto.cmd(speed: 0)
+    }
+
+    // — 写 BLE — 支持 withResponse 和 withoutResponse 两种
+    private func writeData(_ data: Data, for char: CBCharacteristic) {
+        guard let p = peripheral else { return }
+        if char.properties.contains(.writeWithoutResponse) {
+            p.writeValue(data, for: char, type: .withoutResponse)
+        }
+        if char.properties.contains(.write) {
+            p.writeValue(data, for: char, type: .withResponse)
+        }
     }
 
     // — 200ms 保活重发 —
@@ -244,7 +256,7 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
             guard let self = self, !self.lastCmd.isEmpty,
                   let p = self.peripheral, let c = self.writeChar else { return }
-            p.writeValue(self.lastCmd, for: c, type: .withoutResponse)
+            self.writeData(self.lastCmd, for: c)
         }
         RunLoop.main.add(t, forMode: .common)
         keepTimer = t
@@ -298,7 +310,16 @@ final class CommandPoller: ObservableObject {
     func start() {
         guard !polling else { return }
         polling = true
-        longPoll()
+        // 先拿当前 seq，跳过历史命令
+        guard let url = URL(string: "\(base)/cmd-poll?token=\(token)") else { longPoll(); return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            if let self = self, let data = data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let now = json["queue_now"] as? Int {
+                self.pollSeq = now
+            }
+            self?.longPoll()
+        }.resume()
     }
 
     func stop() { polling = false }
